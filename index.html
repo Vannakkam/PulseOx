@@ -66,6 +66,13 @@
                     animation:pulse 1.2s infinite}
   @keyframes pulse{50%{opacity:.25}}
   .pill.sync{background:#14532d55; color:#bbf7d0; border:1px solid #22c55e55}
+  .pill.off{background:#33415544; color:#cbd5e1; border:1px solid #47556955}
+  .pill.warm{background:#78350f55; color:#fde68a; border:1px solid #f59e0b55}
+  .pill.calc{background:#0c4a6e66; color:#bae6fd; border:1px solid #0ea5e955}
+  .pill.ok{background:#14532d55; color:#bbf7d0; border:1px solid #22c55e55}
+  .state-card{grid-column:span 12; padding:12px 16px}
+  .state-line{display:flex; align-items:center; gap:12px; flex-wrap:wrap}
+  .state-line .hint{flex:1 1 260px; margin:0}
   button{
     font:inherit; font-weight:600; border-radius:10px; border:1px solid #ffffff1f;
     background:#1e293b; color:var(--text); padding:9px 13px; cursor:pointer;
@@ -127,6 +134,13 @@
 </header>
 
 <main>
+  <section class="card state-card">
+    <div class="state-line">
+      <span id="statePill" class="pill idle">Not connected</span>
+      <span id="stateHint" class="hint">Pair with the sensor to start.</span>
+    </div>
+  </section>
+
   <section class="card clock-card">
     <div class="label">Current date &amp; time · GMT+5:30</div>
     <div class="clock" id="clockTime">--:--:--</div>
@@ -158,6 +172,8 @@
     <div class="row"><span>Recorded rows</span><b id="rowsVal">0</b></div>
     <div class="row"><span>CSV size</span><b id="bytesVal">0 B</b></div>
     <div class="row"><span>Sample rate</span><b id="fsVal">—</b></div>
+    <div class="row"><span>Sensor</span><b id="sensorState">—</b></div>
+    <div class="row"><span>Perfusion (PI)</span><b id="piVal">—</b></div>
     <div class="row"><span>Clock</span><b id="clockState">not synced</b></div>
     <div class="row"><span>Last live update</span><b id="lastUpdate">—</b></div>
   </section>
@@ -219,11 +235,35 @@ const $ = (id) => document.getElementById(id);
 const ble = { device:null, server:null, service:null, live:null, ctrl:null, status:null, data:null };
 let connected = false;
 
-let devStatus = { recording:false, synced:false, fsReady:false, rows:0, bytes:0, epoch:0, fs:0 };
+let devStatus = {
+  recording:false, synced:false, fsReady:false,
+  rows:0, bytes:0, epoch:0, fs:0,
+  bpm:0, spo2:0, pi:0, state:-1, warmup:0, version:0
+};
 let statusAt = 0;
-let lastSampleAt = 0;
+let lastNotifyAt = 0;                   // last live notification
+let lastValueAt = 0;                    // last time the cards were updated
 let samples = [];                       // {at, epoch, bpm, spo2}
 const MAX_SAMPLES = 900;                // 15 minutes at 1 Hz
+let lastSampleEpoch = -1;
+
+// Device states reported by the firmware.
+const STATES = [
+  { cls:"off",  label:"Finger off",
+    hint:() => "Place your fingertip gently on the sensor." },
+  { cls:"warm", label:"Warming up",
+    hint:(s) => s.warmup > 0
+      ? `Hold still — ${s.warmup} s of warm-up left.`
+      : "Hold still — measuring the signal baseline." },
+  { cls:"calc", label:"Detecting pulse",
+    hint:() => "Signal detected. Keep still and press gently until a steady pulse is found." },
+  { cls:"calc", label:"Measuring SpO₂",
+    hint:() => "Pulse found. Calculating oxygen saturation…" },
+  { cls:"ok",   label:"Measuring",
+    hint:() => "Live pulse rate and SpO₂ are updating." }
+];
+const NOTE_BPM  = ["finger off","warming up","detecting pulse","detecting pulse","live"];
+const NOTE_SPO2 = ["finger off","warming up","needs a steady pulse","calculating SpO₂","live"];
 
 const dl = { active:false, expected:-1, received:0, chunks:[], resolve:null, interrupted:false };
 
@@ -288,8 +328,8 @@ function tickClock() {
     $("deviceClock").textContent = "not synced";
   }
 
-  if (lastSampleAt) {
-    const age = Math.max(0, Math.round((now - lastSampleAt) / 1000));
+  if (lastValueAt) {
+    const age = Math.max(0, Math.round((now - lastValueAt) / 1000));
     $("lastUpdate").textContent = age <= 1 ? "just now" : `${age} s ago`;
   }
 }
@@ -320,11 +360,62 @@ function renderStatus() {
   $("rowsVal").textContent = devStatus.rows.toLocaleString();
   $("bytesVal").textContent = fmtBytes(devStatus.bytes);
   $("fsVal").textContent = devStatus.fs ? `${devStatus.fs} Hz` : "—";
+  $("piVal").textContent = devStatus.pi > 0 ? `${devStatus.pi.toFixed(1)} %` : "—";
   $("clockState").textContent = devStatus.synced ? "synced" : "not synced";
   $("syncState").textContent = devStatus.synced
     ? "Records are timestamped in GMT+5:30."
     : "Connect to send the system time to the sensor.";
+  renderState();
   updateControls();
+}
+
+function renderState() {
+  const pill = $("statePill");
+  const hint = $("stateHint");
+
+  if (!connected) {
+    pill.className = "pill idle";
+    pill.textContent = "Not connected";
+    hint.textContent = "Pair with the sensor to start.";
+    $("sensorState").textContent = "—";
+    return;
+  }
+  if (devStatus.state < 0) {
+    pill.className = "pill idle";
+    pill.textContent = "Waiting for data";
+    hint.textContent = "Connected — waiting for the first measurement packet.";
+    $("sensorState").textContent = "—";
+    return;
+  }
+
+  const info = STATES[devStatus.state] ||
+               { cls:"idle", label:"Unknown", hint:() => "" };
+  pill.className = "pill " + info.cls;
+  pill.textContent = info.label;
+  hint.textContent = info.hint(devStatus);
+  $("sensorState").textContent = info.label;
+}
+
+// Updates the two metric cards. `state` is the firmware state (0..4) or -1.
+function updateMetrics(bpm, spo2, state) {
+  if (state >= 0) devStatus.state = state;
+  const st = devStatus.state >= 0 ? devStatus.state : 0;
+  setMetric("bpm", bpm > 0 ? String(bpm) : "--",
+            bpm > 0 ? "live" : (NOTE_BPM[st] || "waiting for data"));
+  setMetric("spo2", spo2 > 0 ? String(spo2) : "--",
+            spo2 > 0 ? "live" : (NOTE_SPO2[st] || "waiting for data"));
+  lastValueAt = Date.now();
+  renderState();
+}
+
+function pushSample(epoch, bpm, spo2, at) {
+  if (!bpm && !spo2) return;
+  if (epoch > 0 && epoch === lastSampleEpoch) return;
+  lastSampleEpoch = epoch > 0 ? epoch : lastSampleEpoch;
+  samples.push({ at, epoch, bpm, spo2 });
+  if (samples.length > MAX_SAMPLES) samples.shift();
+  drawChart();
+  renderTable();
 }
 
 function setMetric(id, value, note) {
@@ -368,12 +459,23 @@ async function openGatt() {
   ble.data = null;
 
   ble.live.addEventListener("characteristicvaluechanged", onLive);
-  await ble.live.startNotifications();
+  try {
+    await ble.live.startNotifications();
+  } catch (err) {
+    // Not fatal: the status poll and readValue() fallback still deliver values.
+    toast("Live notifications unavailable — using status polling.", "warn");
+  }
 
   connected = true;
   samples = [];
-  lastSampleAt = 0;
-  devStatus = { recording:false, synced:false, fsReady:false, rows:0, bytes:0, epoch:0, fs:0 };
+  lastSampleEpoch = -1;
+  lastNotifyAt = 0;
+  lastValueAt = 0;
+  devStatus = {
+    recording:false, synced:false, fsReady:false,
+    rows:0, bytes:0, epoch:0, fs:0,
+    bpm:0, spo2:0, pi:0, state:-1, warmup:0, version:0
+  };
   statusAt = 0;
 
   updateConnUI();
@@ -441,14 +543,40 @@ async function refreshStatus(quiet = false) {
   try {
     const v = await ble.status.readValue();
     if (v.byteLength < 14) throw new Error("short status packet");
-    devStatus.recording = !!(v.getUint8(0) & 1);
-    devStatus.synced    = !!(v.getUint8(0) & 2);
-    devStatus.fsReady   = !!(v.getUint8(0) & 4);
+
+    const flags = v.getUint8(0);
+    devStatus.recording = !!(flags & 1);
+    devStatus.synced    = !!(flags & 2);
+    devStatus.fsReady   = !!(flags & 4);
     devStatus.rows      = v.getUint32(1, true);
     devStatus.bytes     = v.getUint32(5, true);
     devStatus.epoch     = v.getUint32(9, true);
     devStatus.fs        = v.getUint8(13);
     statusAt = Date.now();
+
+    if (v.byteLength >= 20) {
+      // Status version 3 also carries the latest measurement and the state.
+      devStatus.version = v.getUint8(19);
+      devStatus.bpm     = v.getUint8(14);
+      devStatus.spo2    = v.getUint8(15);
+      devStatus.pi      = v.getUint8(16) / 10;
+      devStatus.warmup  = v.getUint8(18);
+      const st = v.getUint8(17);
+
+      if (Date.now() - lastNotifyAt > 2500) {
+        // No notifications arriving: drive the cards from the poll.
+        updateMetrics(devStatus.bpm, devStatus.spo2, st);
+        pushSample(devStatus.epoch, devStatus.bpm, devStatus.spo2, Date.now());
+      } else {
+        // Keep the fresher state from notifications.
+        renderState();
+      }
+    } else {
+      // Older 14-byte status: derive the state from the flags.
+      devStatus.state = (flags & 8) ? ((flags & 16) ? 2 : 1) : 0;
+      renderState();
+    }
+
     renderStatus();
   } catch (err) {
     if (!quiet) toast("Could not read device status: " + err.message, "error");
@@ -505,26 +633,37 @@ $("refreshBtn").addEventListener("click", async () => {
 });
 
 /* ------------------------------- live data ------------------------------- */
-function onLive(event) {
-  const text = new TextDecoder().decode(event.target.value).trim();
+// Accepts the DataView from a notification or from readValue().
+function handleLive(dv, fromPoll = false) {
+  const text = new TextDecoder().decode(dv).trim();
   const parts = text.split(",");
   if (parts.length < 3) return;
 
   const epoch = Number(parts[0]) || 0;
   const bpm   = Number(parts[1]) || 0;
   const spo2  = Number(parts[2]) || 0;
-  lastSampleAt = Date.now();
+  const state = parts.length >= 4
+    ? Number(parts[3])
+    : (bpm > 0 ? (spo2 > 0 ? 4 : 3) : -1);
 
-  setMetric("bpm", bpm > 0 ? String(bpm) : "--",
-           bpm > 0 ? "live from the IR channel" : "no pulse yet");
-  setMetric("spo2", spo2 > 0 ? String(spo2) : "--",
-           spo2 > 0 ? "ratio-of-ratios" : "needs a stable pulse");
+  if (!fromPoll) lastNotifyAt = Date.now();
+  updateMetrics(bpm, spo2, state);
+  pushSample(epoch, bpm, spo2, Date.now());
+}
 
-  samples.push({ at: lastSampleAt, epoch, bpm, spo2 });
-  if (samples.length > MAX_SAMPLES) samples.shift();
+function onLive(event) {
+  handleLive(event.target.value, false);
+}
 
-  drawChart();
-  renderTable();
+// Fallback used when the browser does not receive notifications.
+async function pollLive() {
+  if (!connected || !ble.live) return;
+  try {
+    const v = await ble.live.readValue();
+    handleLive(v, true);
+  } catch (err) {
+    // Older firmware exposes the live characteristic as notify-only.
+  }
 }
 
 /* ------------------------------ CSV download ----------------------------- */
@@ -772,7 +911,11 @@ renderStatus();
 sizeCanvas();
 tickClock();
 
-setInterval(() => { if (connected && !dl.active) refreshStatus(true); }, 2000);
+setInterval(async () => {
+  if (!connected || dl.active) return;
+  if (Date.now() - lastNotifyAt > 3500) await pollLive();
+  await refreshStatus(true);
+}, 1500);
 </script>
 </body>
 </html>

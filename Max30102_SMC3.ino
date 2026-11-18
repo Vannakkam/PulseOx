@@ -635,6 +635,16 @@ static volatile uint32_t cmdEpoch   = 0;
 static String            lastCtrl;
 static uint32_t          lastCtrlPollMs = 0;
 
+// Latest 1 Hz measurement, mirrored into the status characteristic so the
+// dashboard can show values even if it never receives a notification.
+//   state: 0 = no finger, 1 = warm-up, 2 = pulse not found yet,
+//          3 = pulse found but SpO2 pending, 4 = both valid
+static uint8_t devState    = 0;
+static uint8_t liveBpm     = 0;
+static uint8_t liveSpo2    = 0;
+static uint8_t livePiX10   = 0;
+static uint8_t warmupLeftS = 0;
+
 static uint32_t nowEpoch() {
   if (!clockSynced) return 0;
   return clockBaseEpoch + (millis() - clockBaseMs) / 1000;
@@ -848,20 +858,52 @@ static void blePollControl(uint32_t now) {
   }
 }
 
-// 14-byte binary status:
-//   [0] flags (1=recording, 2=clock synced, 4=file system ok)
+// 20-byte binary status (version 3):
+//   [0]    flags: 1=recording, 2=clock synced, 4=file system ok,
+//                 8=finger present, 16=warm-up finished
 //   [1..4] rows, [5..8] bytes, [9..12] epoch, [13] sample rate in Hz
+//   [14] bpm, [15] spo2, [16] perfusion index x10,
+//   [17] state (0..4), [18] warm-up seconds left, [19] version = 3
 static void updateStatusValue() {
   if (statusChar == nullptr) return;
-  uint8_t b[14];
-  b[0] = (recording ? 1 : 0) | (clockSynced ? 2 : 0) | (fsReady ? 4 : 0);
+  uint8_t b[20];
+  b[0] = (recording ? 1 : 0) | (clockSynced ? 2 : 0) | (fsReady ? 4 : 0) |
+         (fingerPresent ? 8 : 0) |
+         ((fingerPresent && (int32_t)(millis() - warmupUntil) >= 0) ? 16 : 0);
   putU32(b + 1, recRows);
   putU32(b + 5, recBytes);
   putU32(b + 9, nowEpoch());
   float fs = (sampleDt > 0.0f) ? (1.0f / sampleDt) : 0.0f;
   b[13] = (uint8_t)(fs + 0.5f);
+  b[14] = liveBpm;
+  b[15] = liveSpo2;
+  b[16] = livePiX10;
+  b[17] = devState;
+  b[18] = warmupLeftS;
+  b[19] = 3;
   statusChar->setValue(b, sizeof(b));
 }
+
+// Logs when the client enables notifications, so the Serial Monitor explains
+// why the dashboard might be falling back to status polling.
+class LiveCallbacks : public BLECharacteristicCallbacks {
+  void onStatus(BLECharacteristic* c, Status s, uint32_t code) override {
+    (void)c;
+    (void)code;
+    static int last = -1;
+    if ((int)s == last) return;
+    last = (int)s;
+    if (s == SUCCESS_NOTIFY) {
+      Serial.println("BLE: live notifications active");
+    } else if (s == ERROR_NOTIFY_DISABLED) {
+      Serial.println("BLE: live notify not subscribed (dashboard uses status polling)");
+    } else if (s == ERROR_NO_CLIENT) {
+      Serial.println("BLE: live notify skipped (no client)");
+    } else if (s == ERROR_GATT) {
+      Serial.println("BLE: live notify send failed");
+    }
+  }
+};
 
 static void bleBegin() {
   BLEDevice::init(BLE_NAME);
@@ -872,8 +914,10 @@ static void bleBegin() {
 
   BLEService* svc = bleServer->createService(SERVICE_UUID);
 
-  liveChar = svc->createCharacteristic(LIVE_UUID, BLECharacteristic::PROPERTY_NOTIFY);
+  liveChar = svc->createCharacteristic(
+    LIVE_UUID, BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY);
   liveChar->addDescriptor(new BLE2902());
+  liveChar->setCallbacks(new LiveCallbacks());
 
   ctrlChar = svc->createCharacteristic(
     CTRL_UUID, BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_WRITE_NR);
@@ -896,18 +940,20 @@ static void bleBegin() {
 }
 
 static void bleProcessCommands(uint32_t now) {
+  bool changed = false;
   if (cmdTimeSet) {
     cmdTimeSet = false;
     clockBaseEpoch = cmdEpoch;
     clockBaseMs    = millis();
     clockSynced    = true;
+    changed        = true;
     Serial.printf("BLE: clock set to %lu\n", (unsigned long)cmdEpoch);
   }
-  if (cmdStart) { cmdStart = false; startRecording(); }
-  if (cmdStop)  { cmdStop  = false; stopRecording();  }
-  if (cmdClear) { cmdClear = false; clearRecording(); }
-  if (cmdDump)  { cmdDump  = false; dumpCsv();        }
-  updateStatusValue();
+  if (cmdStart) { cmdStart = false; startRecording(); changed = true; }
+  if (cmdStop)  { cmdStop  = false; stopRecording();  changed = true; }
+  if (cmdClear) { cmdClear = false; clearRecording(); changed = true; }
+  if (cmdDump)  { cmdDump  = false; dumpCsv();        changed = true; }
+  if (changed) updateStatusValue();
 }
 
 /* --------------------------------- setup --------------------------------- */
@@ -1009,6 +1055,34 @@ void loop() {
   bool bpmOk     = measuring && bpmDisplay > 0.0f;
   bool spo2Ok    = measuring && spo2Valid;
 
+  /* --- device state shown on the dashboard -------------------------------- */
+  if (!fingerPresent)  devState = 0;   // finger off
+  else if (!measuring) devState = 1;   // warming up
+  else if (!bpmOk)     devState = 2;   // pulse not found yet
+  else if (!spo2Ok)    devState = 3;   // pulse ok, SpO2 pending
+  else                 devState = 4;   // both valid
+
+  float bpmNow = bpmOk ? bpmDisplay : 0.0f;
+  if (bpmNow < 0.0f)   bpmNow = 0.0f;
+  if (bpmNow > 255.0f) bpmNow = 255.0f;
+  liveBpm  = (uint8_t)(bpmNow + 0.5f);
+  liveSpo2 = spo2Ok ? (uint8_t)(spo2Value + 0.5f)  : 0;
+
+  float piNow = spo2Ok ? perfusion : 0.0f;
+  if (piNow < 0.0f)  piNow = 0.0f;
+  if (piNow > 25.0f) piNow = 25.0f;
+  livePiX10 = (uint8_t)(piNow * 10.0f + 0.5f);
+
+  if (fingerPresent && !measuring) {
+    int32_t left = (int32_t)(warmupUntil - now);
+    left = (left + 999) / 1000;
+    if (left < 0)   left = 0;
+    if (left > 255) left = 255;
+    warmupLeftS = (uint8_t)left;
+  } else {
+    warmupLeftS = 0;
+  }
+
   /* --- serial monitor ----------------------------------------------------- */
   if (!fingerPresent) {
     Serial.printf("%5lus   no finger (IR=%lu, RED=%lu)\n",
@@ -1040,12 +1114,11 @@ void loop() {
   }
   satSeen = false;
 
-  /* --- BLE live value: "<epoch>,<bpm>,<spo2>" (0 = not valid yet) ---------- */
+  /* --- BLE live value: "<epoch>,<bpm>,<spo2>,<state>" ---------------------- */
+  // Max 20 bytes so it still fits a 23-byte ATT MTU.
   char live[24];
-  snprintf(live, sizeof(live), "%lu,%d,%d",
-           (unsigned long)nowEpoch(),
-           bpmOk ? (int)(bpmDisplay + 0.5f) : 0,
-           spo2Ok ? (int)(spo2Value + 0.5f) : 0);
+  snprintf(live, sizeof(live), "%lu,%u,%u,%u",
+           (unsigned long)nowEpoch(), liveBpm, liveSpo2, devState);
   bleNotifyText(liveChar, live);
 
   /* --- CSV recording: one row per second while a finger is present -------- */

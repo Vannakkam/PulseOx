@@ -87,6 +87,10 @@ keep still, wait a few seconds...
 Allow 5–10 s after placing the finger: BPM needs a few beats, SpO2 needs a
 4 s window and a valid pulse.
 
+When the dashboard connects, the Serial Monitor also prints
+`BLE: connected (MTU …)` and then either `BLE: live notifications active`
+or `BLE: live notify not subscribed (dashboard uses status polling)`.
+
 ## BLE dashboard (`index.html`)
 
 ### Requirements
@@ -121,8 +125,11 @@ python3 -m http.server 8000
 7. **Clear device log** deletes the stored CSV on the ESP32.
 
 The live cards show BPM and SpO2; the chart keeps the last 3 minutes and the
-table lists the last 12 measurements. If the page is not connected, **Download
-CSV** exports the samples this page has collected instead.
+table lists the last 12 measurements. A banner above the cards reports the
+sensor state — **Finger off**, **Warming up**, **Detecting pulse**,
+**Measuring SpO₂** or **Measuring** — with a hint and the warm-up countdown,
+so it is clear whether the setup is working. If the page is not connected,
+**Download CSV** exports the samples this page has collected instead.
 
 ### CSV format
 
@@ -145,12 +152,24 @@ Service UUID `7a1f0001-3c2d-4e5f-8a9b-0c1d2e3f4a5b`.
 
 | Characteristic | UUID suffix | Properties | Format |
 |----------------|-------------|------------|--------|
-| Live | `…0002…` | notify | text `epoch,bpm,spo2`, one line per second; `0` = invalid |
+| Live | `…0002…` | read, notify | text `epoch,bpm,spo2,state`, one line per second; `0` = invalid |
 | Control | `…0003…` | write | `TIME:<unixSeconds>`, `START`, `STOP`, `CLEAR`, `DUMP` |
-| Status | `…0004…` | read | 14 bytes: flags, rows u32, bytes u32, epoch u32, fs u8 (all little-endian) |
+| Status | `…0004…` | read | 20 bytes (see below) |
 | Data | `…0005…` | notify | `B,<bytes>` then raw CSV chunks then `E` |
 
-Status flags: bit 0 = recording, bit 1 = clock synced, bit 2 = LittleFS ready.
+Status bytes (little-endian): `[0]` flags, `[1..4]` rows, `[5..8]` bytes,
+`[9..12]` epoch, `[13]` sample rate, `[14]` bpm, `[15]` spo2, `[16]` PI×10,
+`[17]` state, `[18]` warm-up seconds left, `[19]` version = 3.
+
+Status flags: bit 0 = recording, bit 1 = clock synced, bit 2 = LittleFS ready,
+bit 3 = finger present, bit 4 = warm-up finished.
+
+State values: `0` finger off, `1` warming up, `2` detecting pulse,
+`3` pulse found / SpO₂ pending, `4` both values valid.
+
+The dashboard subscribes to Live notifications for 1 Hz updates. It also polls
+Status every 1.5 s, so the readings and the state banner keep working even if a
+browser does not deliver notifications.
 
 The dashboard negotiates the ATT MTU with the device; CSV chunks are sized to
 the negotiated MTU (up to 240 bytes) so the transfer is quick on both Android
@@ -217,6 +236,7 @@ and desktop.
 | "Web Bluetooth is not available" | Use Chrome/Edge, not Firefox/Safari. On Android enable Bluetooth and Location. |
 | Connect button does nothing / secure-context error | Open the page via `http://localhost:8000` (or HTTPS), not `file://`. |
 | `Could not read device status` | The GATT connection dropped; reconnect. Keep the phone/PC within a few metres. |
+| Cards stay `--` while the Serial Monitor shows values | Reload the page after uploading the new firmware. Check the Serial Monitor: `BLE: live notifications active` means notifications work; `not subscribed` means the page is using the automatic status-polling fallback (values still update every 1.5 s). |
 | Download times out | Move closer, stop other BLE activity, retry. The transfer is paced so the ESP32 BLE queue cannot overflow; a full 1.4 MB log can take a minute or two. |
 | Downloaded CSV is incomplete | Some notifications were lost (distance/interference). The page saves what arrived and warns; reconnect and download again. |
 | Downloaded CSV is empty | Rows are only written while a finger is detected. Place the finger, wait for BPM/SpO2, then start recording. |
